@@ -122,9 +122,9 @@ __global__ void kernel_point_add_and_check_oneinv(
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool pref = hash160_prefix_equals(h20, target_prefix);
-            if (__any_sync(full_mask, pref)) {
-                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+            bool hit = bloom_contains_hash160(d_bloom, h20);
+            if (__any_sync(full_mask, hit)) {
+                if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                         d_found_result->threadId = (int)gid;
                         d_found_result->iter     = 0;
@@ -138,7 +138,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                         atomicExch(d_found_flag, FOUND_READY);
                     }
                 }
-                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
+                __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
             }
         }
 
@@ -200,9 +200,9 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool pref = hash160_prefix_equals(h20, target_prefix);
-                if (__any_sync(full_mask, pref)) {
-                    if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+                bool hit = bloom_contains_hash160(d_bloom, h20);
+                if (__any_sync(full_mask, hit)) {
+                    if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                             uint64_t addv=(uint64_t)(i+1);
@@ -221,7 +221,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                             atomicExch(d_found_flag, FOUND_READY);
                         }
                     }
-                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
+                    __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
                 }
             }
 
@@ -246,9 +246,9 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool pref = hash160_prefix_equals(h20, target_prefix);
-                if (__any_sync(full_mask, pref)) {
-                    if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+                bool hit = bloom_contains_hash160(d_bloom, h20);
+                if (__any_sync(full_mask, hit)) {
+                    if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                             uint64_t sub=(uint64_t)(i+1);
@@ -266,7 +266,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                             atomicExch(d_found_flag, FOUND_READY);
                         }
                     }
-                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
+                    __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
                 }
             }
 
@@ -302,9 +302,9 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool pref = hash160_prefix_equals(h20, target_prefix);
-            if (__any_sync(full_mask, pref)) {
-                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+            bool hit = bloom_contains_hash160(d_bloom, h20);
+            if (__any_sync(full_mask, hit)) {
+                if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                         uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                         uint64_t sub=(uint64_t)half;
@@ -322,7 +322,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                         atomicExch(d_found_flag, FOUND_READY);
                     }
                 }
-                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
+                __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
             }
 
             uint64_t last_dx[4];
