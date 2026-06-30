@@ -84,6 +84,34 @@ Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 
 ---
 
+## 🧱 Building the bloom filter (`hex2blf`)
+
+`CUDACyclone` matches against a bloom filter, not a single address. Build the `*.blf`
+file with the bundled **`hex2blf`** utility (from Brainflayer) from a text file
+containing one hash160 per line (40 hex chars each).
+
+```bash
+# Build the tool (CPU-only; -lm is needed for the false-positive estimate)
+g++ -O2 hex2blf.c -o hex2blf -lm
+# or: make hex2blf
+
+# Generate the filter (creates/updates a 512 MiB puzzle.blf; re-running adds to it)
+./hex2blf hashes.hex puzzle.blf
+```
+
+Example `hashes.hex`:
+```
+b190e2d40cfdeee2cee072954a2be89e7ba39364
+9a012260d01c5113df66c8a8438c9f7a1e3d5dac
+```
+
+Then search against it:
+```bash
+./CUDACyclone --range 2000000000:3FFFFFFFFF -b puzzle.blf --grid 512,256
+```
+
+---
+
 ### ❔ Community benchmarks
 
 Users have reported the following speeds:

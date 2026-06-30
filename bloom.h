@@ -59,6 +59,30 @@ static unsigned int bloom_chk_hash160(unsigned char* bloom, uint32_t* h) {
 	t = BH19(h); if (BLOOM_GET_BIT(t) == 0) { return 0; }
 	return 1;
 }
+
+static void bloom_set_hash160(unsigned char* bloom, uint32_t* h) {
+	unsigned int t;
+	t = BH00(h); BLOOM_SET_BIT(t);
+	t = BH01(h); BLOOM_SET_BIT(t);
+	t = BH02(h); BLOOM_SET_BIT(t);
+	t = BH03(h); BLOOM_SET_BIT(t);
+	t = BH04(h); BLOOM_SET_BIT(t);
+	t = BH05(h); BLOOM_SET_BIT(t);
+	t = BH06(h); BLOOM_SET_BIT(t);
+	t = BH07(h); BLOOM_SET_BIT(t);
+	t = BH08(h); BLOOM_SET_BIT(t);
+	t = BH09(h); BLOOM_SET_BIT(t);
+	t = BH10(h); BLOOM_SET_BIT(t);
+	t = BH11(h); BLOOM_SET_BIT(t);
+	t = BH12(h); BLOOM_SET_BIT(t);
+	t = BH13(h); BLOOM_SET_BIT(t);
+	t = BH14(h); BLOOM_SET_BIT(t);
+	t = BH15(h); BLOOM_SET_BIT(t);
+	t = BH16(h); BLOOM_SET_BIT(t);
+	t = BH17(h); BLOOM_SET_BIT(t);
+	t = BH18(h); BLOOM_SET_BIT(t);
+	t = BH19(h); BLOOM_SET_BIT(t);
+}
 #pragma GCC diagnostic pop
 
 //#define bloom_new() malloc(536870912)
