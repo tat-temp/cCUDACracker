@@ -20,6 +20,8 @@ Despite its simplicity, Cyclone CUDA leverages **massive GPU parallelism** to ac
 My software was skipping keys earlier.  
 I fixed this problem, to make sure that keys are not skipped I wrote a small script in python.   
 The script is called **proof.py**. The script generates random scalars in a given range, calculates addresses, then runs Cyclone and at the end of the work shows how many keys were found and how many were not found. All should be found.
+
+> **Note:** `proof.py` was written for the old single-target `--address` interface and needs adapting to the bloom-only CLI (build a `.blf` from the generated addresses and pass `-b`, then parse the `Hash160`/`Address` lines).
 Usage
 ```
 sage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRID_ARG] [--batch BATCH] [--timeout TIMEOUT] [--start-count START_COUNT] [--end-count END_COUNT] [--quartile-count QUARTILE_COUNT]
@@ -64,6 +66,7 @@ Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 
 - **GPU Acceleration**: Optimized for NVIDIA GPUs with full CUDA support.
 - **Massive Parallelism**: Tens of thousands of threads computing elliptic curve points and **hash160** simultaneously.
+- **Multi-target via bloom filter**: matches every key in the range against a Brainflayer-style `*.blf` bloom filter and reports **all** hits (the search does not stop on the first match).
 - **Batch EC Operations**: Efficient group addition and modular inversion with warp-level optimizations.
 - **Grid/Batch Control**: Fully configurable GPU execution with `--grid` parameter (threads per batch × points per batch).
 - **Cross-Platform**: Works on Linux and Windows (via WSL2 or MinGW cross-compilation).
@@ -73,10 +76,11 @@ Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 
 ## 🚀 Options
 - **--range**: range of search. Must be a power of two!
-- **--address**: P2PKH address.
-- **--target-hash160**: the same as address but hash160.
+- **-b, --bloom** `<file.blf>`: **required.** Path to a Brainflayer-style bloom filter (2^32 bits / exactly 512 MiB). Every key whose hash160 is present in the filter is reported. Build it with Brainflayer's `hex2blf` from a list of hash160s.
 - **--grid**: very usefull parameter. Example --grid 512,512 - first 512 - number of points each thread will process in one batch (Points batch size)., second 512 - number of threads in one group (Threads per batch).
 - **--slices**: batch per thread for one kernel launch.
+
+> **Note:** A bloom filter gives no false negatives but rare false positives, so a reported hit should be confirmed against your actual address list. The single-target `--address` / `--target-hash160` options were removed in favor of `--bloom`.
 
 ---
 
@@ -102,7 +106,7 @@ Below is an example run of **Cyclone CUDA**.
 **RTX4060**
 
 ```bash
-./CUDACyclone --range 2000000000:3FFFFFFFFF --address 1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2 --grid 512,256
+./CUDACyclone --range 2000000000:3FFFFFFFFF -b puzzle.blf --grid 512,256
 ======== PrePhase: GPU Information ====================
 Device               : NVIDIA GeForce RTX 4060 (compute 8.9)
 SM                   : 24
@@ -119,12 +123,13 @@ Time: 8.0 s | Speed: 1268.9 Mkeys/s | Count: 10204470016 | Progress: 7.42 %
 
 ======== FOUND MATCH! =================================
 Private Key   : 00000000000000000000000000000000000000000000000000000022382FACD0
-Public Key    : 03C060E1E3771CBECCB38E119C2414702F3F5181A89652538851D2E3886BDD70C6
+Hash160       : b190e2d40cfdeee2cee072954a2be89e7ba39364
+Address       : 1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2
 ```
 
 **RTX4090**
 ```bash
-./CUDACyclone --range 200000000000:3fffffffffff --address 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP --grid 128,128 --slices 16
+./CUDACyclone --range 200000000000:3fffffffffff -b puzzle.blf --grid 128,128 --slices 16
 ======== PrePhase: GPU Information ====================
 Device               : NVIDIA GeForce RTX 4090 (compute 8.9)
 SM                   : 128
@@ -142,11 +147,12 @@ Time: 393.7 s | Speed: 6127.4 Mkeys/s | Count: 2421341587872 | Progress: 6.88 %
 
 ======== FOUND MATCH! =================================
 Private Key   : 00000000000000000000000000000000000000000000000000002EC18388D544
-Public Key    : 03FD5487722D2576CB6D7081426B66A3E2986C1CE8358D479063FB5F2BB6DD5849
+Hash160       : 9a012260d01c5113df66c8a8438c9f7a1e3d5dac
+Address       : 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP
 ```
 **RTX5090**
 ```bash
-./CUDACyclone --range 200000000000:3fffffffffff --address 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP —-grid 128,256
+./CUDACyclone --range 200000000000:3fffffffffff -b puzzle.blf —-grid 128,256
 ======== PrePhase: GPU Information ====================
 Device               : NVIDIA GeForce RTX 5090 (compute 12.0)
 SM                   : 170
@@ -164,7 +170,7 @@ Time: 7.0 s | Speed: 8408.0 Mkeys/s | Count: 58545467200 | Progress: 0.17 %
 ```
 **RTX3070 mobile**
 ```bash
-./CUDACyclone --range 2000000000:3FFFFFFFFF --address 1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2 --grid 512,256
+./CUDACyclone --range 2000000000:3FFFFFFFFF -b puzzle.blf --grid 512,256
 ======== PrePhase: GPU Information ====================
 Device               : NVIDIA GeForce RTX 3070 Laptop GPU (compute 8.6)
 SM                   : 40
@@ -182,7 +188,8 @@ Time: 61.2 s | Speed: 1234.3 Mkeys/s | Count: 72707573152 | Progress: 52.90 %
 
 ======== FOUND MATCH! =================================
 Private Key   : 00000000000000000000000000000000000000000000000000000022382FACD0
-Public Key    : 03C060E1E3771CBECCB38E119C2414702F3F5181A89652538851D2E3886BDD70C6
+Hash160       : b190e2d40cfdeee2cee072954a2be89e7ba39364
+Address       : 1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2
 ```
 ## 🛠️ Getting Started
 To get started with CUDACyclone, clone the repository and type **make**  
