@@ -18,7 +18,19 @@ SM_ARCHS += 90
 endif
 
 SM_ARCHS += $(GPU_ARCH)
-GENCODE    := $(foreach arch,$(sort $(SM_ARCHS)),-gencode arch=compute_$(arch),code=sm_$(arch))
+
+# Drop any arch the installed toolkit can't compile (e.g. an auto-detected
+# compute_120 GPU on a pre-12.8 toolkit). Skip filtering if the query is empty.
+NVCC_SUPPORTED := $(shell nvcc --list-gpu-arch 2>/dev/null | sed 's/compute_//')
+ifneq ($(strip $(NVCC_SUPPORTED)),)
+SM_ARCHS := $(filter $(NVCC_SUPPORTED),$(SM_ARCHS))
+endif
+
+# Highest target arch (numeric max). Embed its PTX too, so the binary still runs
+# via JIT on a GPU newer than the toolkit (e.g. an sm_120 card built with CUDA 12.4).
+SM_TOP  := $(shell printf '%s\n' $(SM_ARCHS) | sort -n | tail -n1)
+GENCODE := $(foreach arch,$(sort $(SM_ARCHS)),-gencode arch=compute_$(arch),code=sm_$(arch)) \
+           -gencode arch=compute_$(SM_TOP),code=compute_$(SM_TOP)
 
 # --maxrregcount=128 matches the kernel's __launch_bounds__(256,2) ceiling so that
 # separately-compiled device functions (e.g. getHash160_65_from_limbs) stay within
