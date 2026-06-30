@@ -20,7 +20,10 @@ endif
 SM_ARCHS += $(GPU_ARCH)
 GENCODE    := $(foreach arch,$(sort $(SM_ARCHS)),-gencode arch=compute_$(arch),code=sm_$(arch))
 
-NVCC_FLAGS := -O3 -rdc=true -use_fast_math --ptxas-options=-O3 $(GENCODE)
+# --maxrregcount=128 matches the kernel's __launch_bounds__(256,2) ceiling so that
+# separately-compiled device functions (e.g. getHash160_65_from_limbs) stay within
+# the caller's register budget; without it nvlink rejects the call on sm_90.
+NVCC_FLAGS := -O3 -rdc=true -use_fast_math --maxrregcount=128 --ptxas-options=-O3 $(GENCODE)
 CXXFLAGS   := -std=c++17
 
 LDFLAGS    := -lcudadevrt -cudart=static
