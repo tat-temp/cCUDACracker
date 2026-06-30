@@ -496,3 +496,55 @@ __device__ __noinline__ void getHash160_33_from_limbs(uint8_t prefix02_03,
     SHA256_33_from_limbs(prefix02_03, x_be_limbs, sha_state);
     RIPEMD160_from_SHA256_state(sha_state, out20);
 }
+
+// SHA-256 of the 65-byte uncompressed pubkey (0x04 || X(32 BE) || Y(32 BE)).
+// 65 bytes span two SHA-256 blocks; the message-length field is 65*8 = 520 bits.
+__device__ __forceinline__ void SHA256_65_from_limbs(const uint64_t x_be_limbs[4],
+                                                     const uint64_t y_be_limbs[4],
+                                                     uint32_t out_state[16])
+{
+    const uint64_t x3=x_be_limbs[3], x2=x_be_limbs[2], x1=x_be_limbs[1], x0=x_be_limbs[0];
+    const uint64_t y3=y_be_limbs[3], y2=y_be_limbs[2], y1=y_be_limbs[1], y0=y_be_limbs[0];
+
+    uint32_t st[8];
+    SHA256Initialize(st);
+
+    uint32_t M[16];
+    // Block 0: 0x04 || X(32) || Y[0..30]  (the last Y byte spills into block 1)
+    M[0]  = pack_be4(0x04u, (uint8_t)(x3>>56), (uint8_t)(x3>>48), (uint8_t)(x3>>40));
+    M[1]  = pack_be4((uint8_t)(x3>>32),(uint8_t)(x3>>24),(uint8_t)(x3>>16),(uint8_t)(x3>>8));
+    M[2]  = pack_be4((uint8_t)(x3>>0),(uint8_t)(x2>>56),(uint8_t)(x2>>48),(uint8_t)(x2>>40));
+    M[3]  = pack_be4((uint8_t)(x2>>32),(uint8_t)(x2>>24),(uint8_t)(x2>>16),(uint8_t)(x2>>8));
+    M[4]  = pack_be4((uint8_t)(x2>>0),(uint8_t)(x1>>56),(uint8_t)(x1>>48),(uint8_t)(x1>>40));
+    M[5]  = pack_be4((uint8_t)(x1>>32),(uint8_t)(x1>>24),(uint8_t)(x1>>16),(uint8_t)(x1>>8));
+    M[6]  = pack_be4((uint8_t)(x1>>0),(uint8_t)(x0>>56),(uint8_t)(x0>>48),(uint8_t)(x0>>40));
+    M[7]  = pack_be4((uint8_t)(x0>>32),(uint8_t)(x0>>24),(uint8_t)(x0>>16),(uint8_t)(x0>>8));
+    M[8]  = pack_be4((uint8_t)(x0>>0),(uint8_t)(y3>>56),(uint8_t)(y3>>48),(uint8_t)(y3>>40));
+    M[9]  = pack_be4((uint8_t)(y3>>32),(uint8_t)(y3>>24),(uint8_t)(y3>>16),(uint8_t)(y3>>8));
+    M[10] = pack_be4((uint8_t)(y3>>0),(uint8_t)(y2>>56),(uint8_t)(y2>>48),(uint8_t)(y2>>40));
+    M[11] = pack_be4((uint8_t)(y2>>32),(uint8_t)(y2>>24),(uint8_t)(y2>>16),(uint8_t)(y2>>8));
+    M[12] = pack_be4((uint8_t)(y2>>0),(uint8_t)(y1>>56),(uint8_t)(y1>>48),(uint8_t)(y1>>40));
+    M[13] = pack_be4((uint8_t)(y1>>32),(uint8_t)(y1>>24),(uint8_t)(y1>>16),(uint8_t)(y1>>8));
+    M[14] = pack_be4((uint8_t)(y1>>0),(uint8_t)(y0>>56),(uint8_t)(y0>>48),(uint8_t)(y0>>40));
+    M[15] = pack_be4((uint8_t)(y0>>32),(uint8_t)(y0>>24),(uint8_t)(y0>>16),(uint8_t)(y0>>8));
+    SHA256Transform(st, M);
+
+    // Block 1: last Y byte, 0x80 pad, zeros, then the 64-bit bit length (520).
+    M[0] = pack_be4((uint8_t)(y0>>0), 0x80u, 0x00u, 0x00u);
+#pragma unroll
+    for (int i=1;i<15;++i) M[i]=0u;
+    M[15] = 65u*8u;
+    SHA256Transform(st, M);
+
+#pragma unroll
+    for(int i=0;i<8;++i) out_state[i]= bswap32(st[i]);
+}
+
+__device__ __noinline__ void getHash160_65_from_limbs(const uint64_t x_be_limbs[4],
+                                                      const uint64_t y_be_limbs[4],
+                                                      uint8_t out20[20])
+{
+    uint32_t sha_state[16];
+    SHA256_65_from_limbs(x_be_limbs, y_be_limbs, sha_state);
+    RIPEMD160_from_SHA256_state(sha_state, out20);
+}

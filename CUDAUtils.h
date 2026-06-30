@@ -123,6 +123,52 @@ static __device__ __forceinline__ bool hash160_prefix_equals(
     return load_u32_le(h) == target_prefix;
 }
 
+// Brainflayer-compatible membership test against a 2^32-bit (.blf) bloom filter.
+// The 20-byte hash160 is read as five little-endian 32-bit words (matching how the
+// filter was built on x86), then probed with the same 20 hash functions (BH00..BH19
+// from bloom.h). Returns false on the first cleared bit (definite miss); a true
+// result is only probable and must be confirmed by an exact compare.
+static __device__ __forceinline__ bool bloom_contains_hash160(
+    const unsigned char* __restrict__ bloom,
+    const uint8_t* __restrict__ h)
+{
+    const uint32_t N0 = load_u32_le(h + 0);
+    const uint32_t N1 = load_u32_le(h + 4);
+    const uint32_t N2 = load_u32_le(h + 8);
+    const uint32_t N3 = load_u32_le(h + 12);
+    const uint32_t N4 = load_u32_le(h + 16);
+
+    #define BLOOM_PROBE(IDX) do {                                  \
+        const uint32_t _t = (IDX);                                 \
+        if (((__ldg(&bloom[_t >> 3]) >> (_t & 7)) & 1u) == 0u)     \
+            return false;                                          \
+    } while (0)
+
+    BLOOM_PROBE(N0);
+    BLOOM_PROBE(N1);
+    BLOOM_PROBE(N2);
+    BLOOM_PROBE(N3);
+    BLOOM_PROBE(N4);
+    BLOOM_PROBE((N0 << 16) | (N1 >> 16));
+    BLOOM_PROBE((N1 << 16) | (N2 >> 16));
+    BLOOM_PROBE((N2 << 16) | (N3 >> 16));
+    BLOOM_PROBE((N3 << 16) | (N4 >> 16));
+    BLOOM_PROBE((N4 << 16) | (N0 >> 16));
+    BLOOM_PROBE((N0 <<  8) | (N1 >> 24));
+    BLOOM_PROBE((N1 <<  8) | (N2 >> 24));
+    BLOOM_PROBE((N2 <<  8) | (N3 >> 24));
+    BLOOM_PROBE((N3 <<  8) | (N4 >> 24));
+    BLOOM_PROBE((N4 <<  8) | (N0 >> 24));
+    BLOOM_PROBE((N0 << 24) | (N1 >>  8));
+    BLOOM_PROBE((N1 << 24) | (N2 >>  8));
+    BLOOM_PROBE((N2 << 24) | (N3 >>  8));
+    BLOOM_PROBE((N3 << 24) | (N4 >>  8));
+    BLOOM_PROBE((N4 << 24) | (N0 >>  8));
+
+    #undef BLOOM_PROBE
+    return true;
+}
+
 // вспомогательная: a (256-бит) >= b (u64)?
 __device__ __forceinline__ bool ge256_u64(const uint64_t a[4], uint64_t b) {
     if (a[3] | a[2] | a[1]) return true;  // >= 2^64

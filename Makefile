@@ -20,6 +20,16 @@ $(TARGET): $(OBJ)
 %.o: %.cu
 	$(CC) $(NVCC_FLAGS) $(CXXFLAGS) -c $< -o $@
 
+# Header dependencies, so editing a header forces the affected object to rebuild
+# (the pattern rule above supplies the recipe; these add prerequisites).
+CUDACyclone.o: CUDACyclone.cu CUDAMath.h sha256.h CUDAHash.cuh CUDAUtils.h CUDAStructures.h bloom.h
+CUDAHash.o:    CUDAHash.cu CUDAHash.cuh
+
+# Standalone CPU utility (Brainflayer's hex2blf): builds a .blf bloom filter from
+# a text file of hash160s (one 40-hex-char hash160 per line). Not part of `all`.
+hex2blf: hex2blf.c hex.h hash160.h bloom.h
+	g++ -O2 hex2blf.c -o hex2blf -lm
+
 clean:
-	rm -f $(TARGET) $(OBJ)
+	rm -f $(TARGET) $(OBJ) hex2blf
 
