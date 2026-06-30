@@ -127,6 +127,12 @@ __global__ void kernel_point_add_and_check_oneinv(
             if (bloom_contains_hash160(d_bloom, h20)) {
                 record_found(d_found_results, d_found_count, found_capacity, S, h20);
             }
+
+            uint8_t h20u[20];
+            getHash160_65_from_limbs(x1, y1, h20u);
+            if (bloom_contains_hash160(d_bloom, h20u)) {
+                record_found(d_found_results, d_found_count, found_capacity, S, h20u);
+            }
         }
 
         uint64_t subp[MAX_BATCH_SIZE/2][4];
@@ -166,7 +172,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(dx_inv_i, subp[i], inverse);
 
             {
-                uint64_t px3[4], s[4], lam[4];
+                uint64_t px3[4], s[4], lam[4], y3[4];
                 uint64_t px_i[4], py_i[4];
 #pragma unroll
                 for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
@@ -180,21 +186,26 @@ __global__ void kernel_point_add_and_check_oneinv(
 
                 ModSub256(s, x1, px3); 
                 _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+                ModSub256(y3, s, y1);   // full Y of this point
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                uint64_t addv=(uint64_t)(i+1);
+                for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
+
+                uint8_t h20[20]; getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
-
                 if (bloom_contains_hash160(d_bloom, h20)) {
-                    uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                    uint64_t addv=(uint64_t)(i+1);
-                    for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
                     record_found(d_found_results, d_found_count, found_capacity, fs, h20);
+                }
+
+                uint8_t h20u[20]; getHash160_65_from_limbs(px3, y3, h20u);
+                if (bloom_contains_hash160(d_bloom, h20u)) {
+                    record_found(d_found_results, d_found_count, found_capacity, fs, h20u);
                 }
             }
 
             {
-                uint64_t px3[4], s[4], lam[4];
+                uint64_t px3[4], s[4], lam[4], y3[4];
                 uint64_t px_i[4], py_i[4];
 #pragma unroll
                 for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
@@ -209,16 +220,21 @@ __global__ void kernel_point_add_and_check_oneinv(
 
                 ModSub256(s, x1, px3);
                 _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+                ModSub256(y3, s, y1);   // full Y of this point
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                uint64_t sub=(uint64_t)(i+1);
+                for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+
+                uint8_t h20[20]; getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
-
                 if (bloom_contains_hash160(d_bloom, h20)) {
-                    uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                    uint64_t sub=(uint64_t)(i+1);
-                    for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
                     record_found(d_found_results, d_found_count, found_capacity, fs, h20);
+                }
+
+                uint8_t h20u[20]; getHash160_65_from_limbs(px3, y3, h20u);
+                if (bloom_contains_hash160(d_bloom, h20u)) {
+                    record_found(d_found_results, d_found_count, found_capacity, fs, h20u);
                 }
             }
 
@@ -234,7 +250,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            uint64_t px3[4], s[4], lam[4];
+            uint64_t px3[4], s[4], lam[4], y3[4];
             uint64_t px_i[4], py_i[4];
 #pragma unroll
             for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
@@ -249,16 +265,21 @@ __global__ void kernel_point_add_and_check_oneinv(
 
             ModSub256(s, x1, px3);
             _ModMult(s, s, lam);
-            uint8_t odd; ModSub256isOdd(s, y1, &odd);
+            ModSub256(y3, s, y1);   // full Y of this point
 
-            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+            uint64_t sub=(uint64_t)half;
+            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+
+            uint8_t h20[20]; getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
-
             if (bloom_contains_hash160(d_bloom, h20)) {
-                uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                uint64_t sub=(uint64_t)half;
-                for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
                 record_found(d_found_results, d_found_count, found_capacity, fs, h20);
+            }
+
+            uint8_t h20u[20]; getHash160_65_from_limbs(px3, y3, h20u);
+            if (bloom_contains_hash160(d_bloom, h20u)) {
+                record_found(d_found_results, d_found_count, found_capacity, fs, h20u);
             }
 
             uint64_t last_dx[4];

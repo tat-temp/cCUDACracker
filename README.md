@@ -66,7 +66,7 @@ Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 
 - **GPU Acceleration**: Optimized for NVIDIA GPUs with full CUDA support.
 - **Massive Parallelism**: Tens of thousands of threads computing elliptic curve points and **hash160** simultaneously.
-- **Multi-target via bloom filter**: matches every key in the range against a Brainflayer-style `*.blf` bloom filter and reports **all** hits (the search does not stop on the first match).
+- **Multi-target via bloom filter**: matches every key in the range against a Brainflayer-style `*.blf` bloom filter and reports **all** hits (the search does not stop on the first match). Both the **compressed and uncompressed** public-key hash160 are checked for every key.
 - **Batch EC Operations**: Efficient group addition and modular inversion with warp-level optimizations.
 - **Grid/Batch Control**: Fully configurable GPU execution with `--grid` parameter (threads per batch × points per batch).
 - **Cross-Platform**: Works on Linux and Windows (via WSL2 or MinGW cross-compilation).
