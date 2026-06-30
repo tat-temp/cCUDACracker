@@ -14,12 +14,16 @@
 #include <cmath>
 #include <csignal>
 #include <atomic>
+#include <fstream>
+#include <vector>
+#include <algorithm>
 
 #include "CUDAMath.h"
 #include "sha256.h"
 #include "CUDAHash.cuh"
 #include "CUDAUtils.h"
 #include "CUDAStructures.h"
+#include "bloom.h"
 
 static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
@@ -63,7 +67,8 @@ __global__ void kernel_point_add_and_check_oneinv(
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
     unsigned long long* __restrict__ hashes_accum,
-    unsigned int* __restrict__ d_any_left
+    unsigned int* __restrict__ d_any_left,
+    const unsigned char* __restrict__ d_bloom
 )
 {
     const int B = (int)batch_size;
@@ -382,10 +387,57 @@ extern bool decode_p2pkh_address(const std::string& addr, uint8_t out20[20]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
+// Load a Brainflayer-style *.blf bloom filter (2^32 bits = 512 MiB) into device
+// global memory. On success *d_bloom_out holds the device pointer (caller frees).
+static bool load_blf_to_device(const std::string& path, unsigned char** d_bloom_out) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::cerr << "Error: cannot open bloom file: " << path << "\n";
+        return false;
+    }
+    const std::streamsize fsize = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (fsize != (std::streamsize)BLOOM_SIZE) {
+        std::cerr << "Error: bloom file size is " << (long long)fsize
+                  << " bytes, expected " << (long long)BLOOM_SIZE
+                  << " (2^32 bits / 512 MiB).\n";
+        return false;
+    }
+
+    unsigned char* d_bloom = nullptr;
+    cudaError_t e = cudaMalloc(&d_bloom, (size_t)BLOOM_SIZE);
+    if (e != cudaSuccess) {
+        std::cerr << "cudaMalloc(d_bloom): " << cudaGetErrorString(e) << "\n";
+        return false;
+    }
+
+    const size_t CHUNK = 8ull * 1024 * 1024;
+    std::vector<char> buf(CHUNK);
+    size_t offset = 0;
+    while (offset < (size_t)BLOOM_SIZE) {
+        const size_t n = std::min(CHUNK, (size_t)BLOOM_SIZE - offset);
+        if (!f.read(buf.data(), (std::streamsize)n)) {
+            std::cerr << "Error: failed reading bloom file (at offset " << offset << ").\n";
+            cudaFree(d_bloom);
+            return false;
+        }
+        e = cudaMemcpy(d_bloom + offset, buf.data(), n, cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            std::cerr << "cudaMemcpy(d_bloom): " << cudaGetErrorString(e) << "\n";
+            cudaFree(d_bloom);
+            return false;
+        }
+        offset += n;
+    }
+
+    *d_bloom_out = d_bloom;
+    return true;
+}
+
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
-    std::string target_hash_hex, range_hex, address_b58;
+    std::string target_hash_hex, range_hex, address_b58, bloom_path;
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
@@ -417,6 +469,7 @@ int main(int argc, char** argv) {
         if      (arg == "--target-hash160" && i + 1 < argc) target_hash_hex = argv[++i];
         else if (arg == "--address"        && i + 1 < argc) address_b58     = argv[++i];
         else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
+        else if ((arg == "--bloom" || arg == "-b") && i + 1 < argc) bloom_path = argv[++i];
         else if (arg == "--grid"           && i + 1 < argc) {
             uint32_t a=0,b=0;
             if (!parse_grid(argv[++i], a, b)) {
@@ -437,9 +490,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
+    if (range_hex.empty() || bloom_path.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
+                  << " --range <start_hex>:<end_hex> -b|--bloom <file.blf> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
         return EXIT_FAILURE;
     }
     if (!target_hash_hex.empty() && !address_b58.empty()) {
@@ -516,6 +569,11 @@ int main(int argc, char** argv) {
     }
 
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+
+    unsigned char* d_bloom = nullptr;
+    if (!load_blf_to_device(bloom_path, &d_bloom)) {
+        return EXIT_FAILURE;
+    }
 
     int threadsPerBlock=256;
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
@@ -740,7 +798,8 @@ int main(int argc, char** argv) {
             slices_per_launch,
             d_found_flag, d_found_result,
             d_hashes_accum,
-            d_any_left
+            d_any_left,
+            d_bloom
         );
         cudaError_t launchErr = cudaGetLastError();
         if (launchErr != cudaSuccess) {
@@ -821,6 +880,7 @@ int main(int argc, char** argv) {
 
     cudaFree(d_start_scalars); cudaFree(d_Px); cudaFree(d_Py); cudaFree(d_Rx); cudaFree(d_Ry);
     cudaFree(d_counts256); cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_hashes_accum); cudaFree(d_any_left);
+    cudaFree(d_bloom);
     cudaStreamDestroy(streamKernel);
 
     if (h_start_scalars) cudaFreeHost(h_start_scalars);
