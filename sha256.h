@@ -131,3 +131,43 @@ static bool decode_p2pkh_address(const std::string& addr, uint8_t out_hash160[20
     std::memcpy(out_hash160, raw.data()+1, 20);
     return true;
 }
+
+static std::string base58_encode(const uint8_t* data, size_t len)
+{
+    static const char* ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    size_t zeros = 0;
+    while (zeros < len && data[zeros] == 0) ++zeros;
+
+    std::vector<uint8_t> b58; // base-58 digits, least significant first
+    b58.reserve((len - zeros) * 138 / 100 + 1);
+    for (size_t i = zeros; i < len; ++i) {
+        int carry = data[i];
+        for (size_t j = 0; j < b58.size(); ++j) {
+            int x = (int)b58[j] * 256 + carry;
+            b58[j] = (uint8_t)(x % 58);
+            carry = x / 58;
+        }
+        while (carry) {
+            b58.push_back((uint8_t)(carry % 58));
+            carry /= 58;
+        }
+    }
+
+    std::string str;
+    str.assign(zeros, '1');
+    for (auto it = b58.rbegin(); it != b58.rend(); ++it) str += ALPH[*it];
+    return str;
+}
+
+// hash160 -> mainnet P2PKH base58 address (version 0x00 + 4-byte double-SHA256 checksum).
+static std::string hash160_to_p2pkh(const uint8_t h20[20])
+{
+    uint8_t payload[25];
+    payload[0] = 0x00;
+    std::memcpy(payload + 1, h20, 20);
+    uint8_t check[32];
+    host_sha256::sha256d(payload, 21, check);
+    std::memcpy(payload + 21, check, 4);
+    return base58_encode(payload, 25);
+}

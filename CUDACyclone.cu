@@ -28,17 +28,24 @@
 static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
 
-__device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
-    return *((const volatile int*)p);
-}
-__device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found_flag,
-                                                 unsigned full_mask,
-                                                 unsigned lane)
+// Record one bloom-filter hit into the results buffer. Lock-free: each hit claims
+// a unique slot via atomicAdd; the global counter keeps counting past capacity so
+// the host can report how many (if any) were dropped.
+__device__ __forceinline__ void record_found(
+    FoundResult* __restrict__ results,
+    unsigned int* __restrict__ count,
+    unsigned int capacity,
+    const uint64_t scalar[4],
+    const uint8_t h20[20])
 {
-    int f = 0;
-    if (lane == 0) f = load_found_flag_relaxed(d_found_flag);
-    f = __shfl_sync(full_mask, f, 0);
-    return f == FOUND_READY;
+    unsigned int idx = atomicAdd(count, 1u);
+    if (idx < capacity) {
+        FoundResult* fr = &results[idx];
+#pragma unroll
+        for (int k = 0; k < 4; ++k)  fr->scalar[k]  = scalar[k];
+#pragma unroll
+        for (int k = 0; k < 20; ++k) fr->hash160[k] = h20[k];
+    }
 }
 
 #ifndef MAX_BATCH_SIZE
@@ -64,8 +71,9 @@ __global__ void kernel_point_add_and_check_oneinv(
     uint64_t threadsTotal,
     uint32_t batch_size,
     uint32_t max_batches_per_launch,
-    int* __restrict__ d_found_flag,
-    FoundResult* __restrict__ d_found_result,
+    unsigned int* __restrict__ d_found_count,
+    FoundResult* __restrict__ d_found_results,
+    unsigned int found_capacity,
     unsigned long long* __restrict__ hashes_accum,
     unsigned int* __restrict__ d_any_left,
     const unsigned char* __restrict__ d_bloom
@@ -78,11 +86,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
 
-    const unsigned lane      = (unsigned)(threadIdx.x & (WARP_SIZE - 1));
-    const unsigned full_mask = 0xFFFFFFFFu;
-    if (warp_found_ready(d_found_flag, full_mask, lane)) return;
-
-    const uint32_t target_prefix = c_target_prefix;
+    const unsigned lane = (unsigned)(threadIdx.x & (WARP_SIZE - 1));
 
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 65536u
@@ -114,31 +118,14 @@ __global__ void kernel_point_add_and_check_oneinv(
     uint32_t batches_done = 0;
 
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
-        if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
-
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool hit = bloom_contains_hash160(d_bloom, h20);
-            if (__any_sync(full_mask, hit)) {
-                if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        d_found_result->threadId = (int)gid;
-                        d_found_result->iter     = 0;
-#pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
-#pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
-#pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
-                    }
-                }
-                __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+            if (bloom_contains_hash160(d_bloom, h20)) {
+                record_found(d_found_results, d_found_count, found_capacity, S, h20);
             }
         }
 
@@ -175,8 +162,6 @@ __global__ void kernel_point_add_and_check_oneinv(
         ModNeg256(sx_neg, x1);
 
         for (int i = 0; i < half - 1; ++i) {
-            if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
-
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
@@ -200,28 +185,11 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool hit = bloom_contains_hash160(d_bloom, h20);
-                if (__any_sync(full_mask, hit)) {
-                    if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t addv=(uint64_t)(i+1);
-                            for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                           
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
-                    }
-                    __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+                if (bloom_contains_hash160(d_bloom, h20)) {
+                    uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                    uint64_t addv=(uint64_t)(i+1);
+                    for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
+                    record_found(d_found_results, d_found_count, found_capacity, fs, h20);
                 }
             }
 
@@ -246,27 +214,11 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool hit = bloom_contains_hash160(d_bloom, h20);
-                if (__any_sync(full_mask, hit)) {
-                    if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t sub=(uint64_t)(i+1);
-                            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-#pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
-                    }
-                    __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+                if (bloom_contains_hash160(d_bloom, h20)) {
+                    uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                    uint64_t sub=(uint64_t)(i+1);
+                    for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+                    record_found(d_found_results, d_found_count, found_capacity, fs, h20);
                 }
             }
 
@@ -302,27 +254,11 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool hit = bloom_contains_hash160(d_bloom, h20);
-            if (__any_sync(full_mask, hit)) {
-                if (hit && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t sub=(uint64_t)half;
-                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
-#pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-#pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-#pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid;
-                        d_found_result->iter     = 0;
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
-                    }
-                }
-                __syncwarp(full_mask); if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+            if (bloom_contains_hash160(d_bloom, h20)) {
+                uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                uint64_t sub=(uint64_t)half;
+                for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+                record_found(d_found_results, d_found_count, found_capacity, fs, h20);
             }
 
             uint64_t last_dx[4];
@@ -380,11 +316,8 @@ __global__ void kernel_point_add_and_check_oneinv(
 }
 
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
-extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
-extern bool decode_p2pkh_address(const std::string& addr, uint8_t out20[20]);
-extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
 // Load a Brainflayer-style *.blf bloom filter (2^32 bits = 512 MiB) into device
@@ -437,7 +370,7 @@ static bool load_blf_to_device(const std::string& path, unsigned char** d_bloom_
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
-    std::string target_hash_hex, range_hex, address_b58, bloom_path;
+    std::string range_hex, bloom_path;
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
@@ -466,9 +399,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--target-hash160" && i + 1 < argc) target_hash_hex = argv[++i];
-        else if (arg == "--address"        && i + 1 < argc) address_b58     = argv[++i];
-        else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
+        if      (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
         else if ((arg == "--bloom" || arg == "-b") && i + 1 < argc) bloom_path = argv[++i];
         else if (arg == "--grid"           && i + 1 < argc) {
             uint32_t a=0,b=0;
@@ -490,13 +421,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (range_hex.empty() || bloom_path.empty() || (target_hash_hex.empty() && address_b58.empty())) {
+    if (range_hex.empty() || bloom_path.empty()) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> -b|--bloom <file.blf> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
-        return EXIT_FAILURE;
-    }
-    if (!target_hash_hex.empty() && !address_b58.empty()) {
-        std::cerr << "Error: provide either --address or --target-hash160, not both.\n";
+                  << " --range <start_hex>:<end_hex> -b|--bloom <file.blf> [--grid A,B] [--slices N]\n";
         return EXIT_FAILURE;
     }
 
@@ -508,17 +435,6 @@ int main(int argc, char** argv) {
     uint64_t range_start[4]{0}, range_end[4]{0};
     if (!hexToLE64(start_hex, range_start) || !hexToLE64(end_hex, range_end)) {
         std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE;
-    }
-
-    uint8_t target_hash160[20];
-    if (!address_b58.empty()) {
-        if (!decode_p2pkh_address(address_b58, target_hash160)) {
-            std::cerr << "Error: invalid P2PKH address\n"; return EXIT_FAILURE;
-        }
-    } else {
-        if (!hexToHash160(target_hash_hex, target_hash160)) {
-            std::cerr << "Error: invalid target hash160 hex\n"; return EXIT_FAILURE;
-        }
     }
 
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
@@ -656,17 +572,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    {
-        uint32_t prefix_le = (uint32_t)target_hash160[0]
-                           | ((uint32_t)target_hash160[1] << 8)
-                           | ((uint32_t)target_hash160[2] << 16)
-                           | ((uint32_t)target_hash160[3] << 24);
-        cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
-        cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
-    }
+    const unsigned int FOUND_CAPACITY = 1u << 16; // max matches retained for printing
 
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
-    int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
+    unsigned int *d_found_count=nullptr; FoundResult *d_found_results=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
 
     auto ck = [](cudaError_t e, const char* msg){
@@ -682,15 +591,15 @@ int main(int argc, char** argv) {
     ck(cudaMalloc(&d_Rx,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Rx)");
     ck(cudaMalloc(&d_Ry,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Ry)");
     ck(cudaMalloc(&d_counts256,    threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_counts256)");
-    ck(cudaMalloc(&d_found_flag,   sizeof(int)),                         "cudaMalloc(d_found_flag)");
-    ck(cudaMalloc(&d_found_result, sizeof(FoundResult)),                 "cudaMalloc(d_found_result)");
+    ck(cudaMalloc(&d_found_count,   sizeof(unsigned int)),                            "cudaMalloc(d_found_count)");
+    ck(cudaMalloc(&d_found_results, (size_t)FOUND_CAPACITY * sizeof(FoundResult)),    "cudaMalloc(d_found_results)");
     ck(cudaMalloc(&d_hashes_accum, sizeof(unsigned long long)),          "cudaMalloc(d_hashes_accum)");
     ck(cudaMalloc(&d_any_left,     sizeof(unsigned int)),                "cudaMalloc(d_any_left)");
 
     ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start_scalars");
     ck(cudaMemcpy(d_counts256,     h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy counts256");
-    { int zero = FOUND_NONE; unsigned long long zero64=0ull;
-      ck(cudaMemcpy(d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
+    { unsigned int zero = 0u; unsigned long long zero64=0ull;
+      ck(cudaMemcpy(d_found_count, &zero,   sizeof(unsigned int),       cudaMemcpyHostToDevice), "init found_count");
       ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
 
     {
@@ -782,6 +691,35 @@ int main(int argc, char** argv) {
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
 
+    // Copy any newly recorded matches off the device and print them. Multi-target
+    // mode never stops on a hit, so this is called periodically and at the end.
+    unsigned int printed = 0;
+    auto drain_found = [&]() {
+        unsigned int h_count = 0;
+        ck(cudaMemcpy(&h_count, d_found_count, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read found_count");
+        if (h_count <= printed) return;
+        unsigned int upto = (h_count < FOUND_CAPACITY) ? h_count : FOUND_CAPACITY;
+        if (printed < upto) {
+            unsigned int n = upto - printed;
+            std::vector<FoundResult> tmp(n);
+            ck(cudaMemcpy(tmp.data(), d_found_results + printed, (size_t)n * sizeof(FoundResult), cudaMemcpyDeviceToHost), "read found_results");
+            for (unsigned int i = 0; i < n; ++i) {
+                char hx[41];
+                for (int b = 0; b < 20; ++b) std::snprintf(hx + 2*b, 3, "%02x", tmp[i].hash160[b]);
+                std::cout << "\n======== FOUND MATCH! =================================\n";
+                std::cout << "Private Key   : " << formatHex256(tmp[i].scalar) << "\n";
+                std::cout << "Hash160       : " << hx << "\n";
+                std::cout << "Address       : " << hash160_to_p2pkh(tmp[i].hash160) << "\n";
+                std::cout.flush();
+            }
+        }
+        if (h_count > FOUND_CAPACITY && printed < FOUND_CAPACITY) {
+            std::cerr << "\n[warn] result buffer full (" << FOUND_CAPACITY << "); "
+                      << (h_count - FOUND_CAPACITY) << " further match(es) counted but not stored.\n";
+        }
+        printed = h_count;
+    };
+
     bool stop_all = false;
     bool completed_all = false;
     while (!stop_all) {
@@ -796,7 +734,7 @@ int main(int argc, char** argv) {
             threadsTotal,
             B,
             slices_per_launch,
-            d_found_flag, d_found_result,
+            d_found_count, d_found_results, FOUND_CAPACITY,
             d_hashes_accum,
             d_any_left,
             d_bloom
@@ -825,11 +763,8 @@ int main(int argc, char** argv) {
                           << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
                 std::cout.flush();
                 lastHashes = h_hashes; tLast = now;
+                drain_found();
             }
-
-            int host_found = 0;
-            ck(cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "read found_flag");
-            if (host_found == FOUND_READY) { stop_all = true; break; }
 
             cudaError_t qs = cudaStreamQuery(streamKernel);
             if (qs == cudaSuccess) break;
@@ -839,6 +774,7 @@ int main(int argc, char** argv) {
         }
 
         cudaStreamSynchronize(streamKernel);
+        drain_found();
         std::cout.flush();
         if (stop_all || g_sigint) break;
 
@@ -852,34 +788,27 @@ int main(int argc, char** argv) {
     }
 
     cudaDeviceSynchronize();
+    drain_found();
     std::cout << "\n";
 
-    int h_found_flag = 0;
-    ck(cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "final read found_flag");
+    unsigned int h_total_found = 0;
+    ck(cudaMemcpy(&h_total_found, d_found_count, sizeof(unsigned int), cudaMemcpyDeviceToHost), "final read found_count");
 
     int exit_code = EXIT_SUCCESS;
 
-    if (h_found_flag == FOUND_READY) {
-        FoundResult host_result{};
-        ck(cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost), "read found_result");
-        std::cout << "\n======== FOUND MATCH! =================================\n";
-        std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
-        std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
+    if (g_sigint) {
+        std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";
+        std::cout << "Search interrupted by user. Partial progress above.\n";
+        exit_code = 130;
+    } else if (completed_all) {
+        std::cout << "======== DONE (exhaustive) ============================\n";
     } else {
-        if (g_sigint) {
-            std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";
-            std::cout << "Search was interrupted by user. Partial progress above.\n";
-            exit_code = 130;
-        } else if (completed_all) {
-            std::cout << "======== KEY NOT FOUND (exhaustive) ===================\n";
-            std::cout << "Target hash160 was not found within the specified range.\n";
-        } else {
-            std::cout << "======== TERMINATED ===================================\n";
-        }
+        std::cout << "======== TERMINATED ===================================\n";
     }
+    std::cout << "Total matches  : " << h_total_found << "\n";
 
     cudaFree(d_start_scalars); cudaFree(d_Px); cudaFree(d_Py); cudaFree(d_Rx); cudaFree(d_Ry);
-    cudaFree(d_counts256); cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_hashes_accum); cudaFree(d_any_left);
+    cudaFree(d_counts256); cudaFree(d_found_count); cudaFree(d_found_results); cudaFree(d_hashes_accum); cudaFree(d_any_left);
     cudaFree(d_bloom);
     cudaStreamDestroy(streamKernel);
 
