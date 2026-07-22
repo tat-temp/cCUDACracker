@@ -1,5 +1,10 @@
 TARGET      := CUDACyclone
-SRC         := CUDACyclone.cu CUDAHash.cu
+# Single-TU build: CUDAHash.cu is #included into CUDACyclone.cu (NOT compiled separately),
+# so the whole device program is one translation unit and builds with rdc=false. This lets
+# ptxas optimize the hash + kernel together and use an intra-module register ABI for the
+# by-value getHash160 (see CUDAHash.cuh for the measured effect). Listing CUDAHash.cu in SRC
+# would emit a duplicate getHash160 device symbol at link.
+SRC         := CUDACyclone.cu
 OBJ         := $(SRC:.cu=.o)
 CC          := nvcc
 
@@ -20,13 +25,14 @@ endif
 SM_ARCHS += $(GPU_ARCH)
 GENCODE    := $(foreach arch,$(sort $(SM_ARCHS)),-gencode arch=compute_$(arch),code=sm_$(arch))
 
-# --maxrregcount=128 matches the kernel's __launch_bounds__(256,2) ceiling so that
-# separately-compiled device functions (e.g. getHash160_65_from_limbs) stay within
-# the caller's register budget; without it nvlink rejects the call on sm_90.
-NVCC_FLAGS := -O3 -rdc=true -use_fast_math --maxrregcount=128 --ptxas-options=-O3 $(GENCODE)
+# rdc=false single-TU build: there are no cross-TU device calls, so -rdc=true and its device
+# runtime (-lcudadevrt) are gone. --maxrregcount is likewise dropped: the kernel's
+# __launch_bounds__(256,2) already caps registers, and without device linking there is no
+# nvlink regcount error to work around. Dropping -rdc lets ptxas optimize hash+kernel together.
+NVCC_FLAGS := -O3 -use_fast_math --ptxas-options=-O3 $(GENCODE)
 CXXFLAGS   := -std=c++17
 
-LDFLAGS    := -lcudadevrt -cudart=static
+LDFLAGS    := -cudart=static
 
 all: $(TARGET)
 
@@ -36,10 +42,11 @@ $(TARGET): $(OBJ)
 %.o: %.cu
 	$(CC) $(NVCC_FLAGS) $(CXXFLAGS) -c $< -o $@
 
-# Header dependencies, so editing a header forces the affected object to rebuild
-# (the pattern rule above supplies the recipe; these add prerequisites).
-CUDACyclone.o: CUDACyclone.cu CUDAMath.h sha256.h CUDAHash.cuh CUDAUtils.h CUDAStructures.h bloom.h
-CUDAHash.o:    CUDAHash.cu CUDAHash.cuh
+# Header + #included-TU dependencies, so editing any of them rebuilds CUDACyclone.o.
+# CUDAHash.cu is #included (single-TU), so it is a prerequisite here, not a separate object;
+# likewise the RCKangaroo field backend headers pulled in via CUDAMath.h -> ec_backend.cuh.
+CUDACyclone.o: CUDACyclone.cu CUDAMath.h ec_backend.cuh third_party/RCKangaroo/RCGpuUtils.h \
+               sha256.h CUDAHash.cuh CUDAHash.cu CUDAUtils.h CUDAStructures.h bloom.h
 
 # Standalone CPU utility (Brainflayer's hex2blf): builds a .blf bloom filter from
 # a text file of hash160s (one 40-hex-char hash160 per line). Not part of `all`.
@@ -48,4 +55,3 @@ hex2blf: hex2blf.c hex.h hash160.h bloom.h
 
 clean:
 	rm -f $(TARGET) $(OBJ) hex2blf
-

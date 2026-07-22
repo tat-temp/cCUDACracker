@@ -21,6 +21,7 @@
 #include "CUDAMath.h"
 #include "sha256.h"
 #include "CUDAHash.cuh"
+#include "CUDAHash.cu"     // single-TU build: pull in the hash implementation (see Makefile)
 #include "CUDAUtils.h"
 #include "CUDAStructures.h"
 #include "bloom.h"
@@ -119,19 +120,17 @@ __global__ void kernel_point_add_and_check_oneinv(
 
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         {
-            uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
-            getHash160_33_from_limbs(prefix, x1, h20);
+            H160 h20 = getHash160_33_from_limbs(prefix, u256_of(x1));
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            if (bloom_contains_hash160(d_bloom, h20)) {
-                record_found(d_found_results, d_found_count, found_capacity, S, h20);
+            if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20.w)) {
+                record_found(d_found_results, d_found_count, found_capacity, S, (const uint8_t*)h20.w);
             }
 
-            uint8_t h20u[20];
-            getHash160_65_from_limbs(x1, y1, h20u);
-            if (bloom_contains_hash160(d_bloom, h20u)) {
-                record_found(d_found_results, d_found_count, found_capacity, S, h20u);
+            H160 h20u = getHash160_65_from_limbs(u256_of(x1), u256_of(y1));
+            if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20u.w)) {
+                record_found(d_found_results, d_found_count, found_capacity, S, (const uint8_t*)h20u.w);
             }
         }
 
@@ -192,15 +191,15 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint64_t addv=(uint64_t)(i+1);
                 for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
 
-                uint8_t h20[20]; getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, px3, h20);
+                H160 h20 = getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, u256_of(px3));
                 ++local_hashes; MAYBE_WARP_FLUSH();
-                if (bloom_contains_hash160(d_bloom, h20)) {
-                    record_found(d_found_results, d_found_count, found_capacity, fs, h20);
+                if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20.w)) {
+                    record_found(d_found_results, d_found_count, found_capacity, fs, (const uint8_t*)h20.w);
                 }
 
-                uint8_t h20u[20]; getHash160_65_from_limbs(px3, y3, h20u);
-                if (bloom_contains_hash160(d_bloom, h20u)) {
-                    record_found(d_found_results, d_found_count, found_capacity, fs, h20u);
+                H160 h20u = getHash160_65_from_limbs(u256_of(px3), u256_of(y3));
+                if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20u.w)) {
+                    record_found(d_found_results, d_found_count, found_capacity, fs, (const uint8_t*)h20u.w);
                 }
             }
 
@@ -226,15 +225,15 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint64_t sub=(uint64_t)(i+1);
                 for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 
-                uint8_t h20[20]; getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, px3, h20);
+                H160 h20 = getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, u256_of(px3));
                 ++local_hashes; MAYBE_WARP_FLUSH();
-                if (bloom_contains_hash160(d_bloom, h20)) {
-                    record_found(d_found_results, d_found_count, found_capacity, fs, h20);
+                if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20.w)) {
+                    record_found(d_found_results, d_found_count, found_capacity, fs, (const uint8_t*)h20.w);
                 }
 
-                uint8_t h20u[20]; getHash160_65_from_limbs(px3, y3, h20u);
-                if (bloom_contains_hash160(d_bloom, h20u)) {
-                    record_found(d_found_results, d_found_count, found_capacity, fs, h20u);
+                H160 h20u = getHash160_65_from_limbs(u256_of(px3), u256_of(y3));
+                if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20u.w)) {
+                    record_found(d_found_results, d_found_count, found_capacity, fs, (const uint8_t*)h20u.w);
                 }
             }
 
@@ -271,15 +270,15 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t sub=(uint64_t)half;
             for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 
-            uint8_t h20[20]; getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, px3, h20);
+            H160 h20 = getHash160_33_from_limbs((y3[0]&1ULL)?0x03:0x02, u256_of(px3));
             ++local_hashes; MAYBE_WARP_FLUSH();
-            if (bloom_contains_hash160(d_bloom, h20)) {
-                record_found(d_found_results, d_found_count, found_capacity, fs, h20);
+            if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20.w)) {
+                record_found(d_found_results, d_found_count, found_capacity, fs, (const uint8_t*)h20.w);
             }
 
-            uint8_t h20u[20]; getHash160_65_from_limbs(px3, y3, h20u);
-            if (bloom_contains_hash160(d_bloom, h20u)) {
-                record_found(d_found_results, d_found_count, found_capacity, fs, h20u);
+            H160 h20u = getHash160_65_from_limbs(u256_of(px3), u256_of(y3));
+            if (bloom_contains_hash160(d_bloom, (const uint8_t*)h20u.w)) {
+                record_found(d_found_results, d_found_count, found_capacity, fs, (const uint8_t*)h20u.w);
             }
 
             uint64_t last_dx[4];

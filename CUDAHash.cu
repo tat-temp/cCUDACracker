@@ -15,15 +15,40 @@ __device__ __forceinline__ uint32_t ror32(uint32_t x, int n)
 #endif
 }
 
-__device__ __forceinline__ uint32_t bigS0(uint32_t x) { return ror32(x, 2) ^ ror32(x, 13) ^ ror32(x, 22); }
-__device__ __forceinline__ uint32_t bigS1(uint32_t x) { return ror32(x, 6) ^ ror32(x, 11) ^ ror32(x, 25); }
-__device__ __forceinline__ uint32_t smallS0(uint32_t x){ return ror32(x, 7) ^ ror32(x, 18) ^ (x >> 3); }
-__device__ __forceinline__ uint32_t smallS1(uint32_t x){ return ror32(x,17) ^ ror32(x, 19) ^ (x >>10); }
+// a ^ b ^ c. Left to ptxas as plain C: it folds this to one LOP3 (0x96) AND is free to
+// fuse it across op boundaries (the RIPEMD-160 f-function audit proved forced lop3.b32
+// asm BLOCKS that fusion, costing +2 LOP3). Inverse-test: does unpinning SHA help too?
+__device__ __forceinline__ uint32_t xor3(uint32_t a, uint32_t b, uint32_t c){
+    return a ^ b ^ c;
+}
 
-__device__ __forceinline__ uint32_t Ch (uint32_t x,uint32_t y,uint32_t z){ return (x & y) ^ (~x & z); }
-__device__ __forceinline__ uint32_t Maj(uint32_t x,uint32_t y,uint32_t z){ return (x & y) | (x & z) | (y & z); }
+__device__ __forceinline__ uint32_t bigS0(uint32_t x) { return xor3(ror32(x, 2), ror32(x, 13), ror32(x, 22)); }
+__device__ __forceinline__ uint32_t bigS1(uint32_t x) { return xor3(ror32(x, 6), ror32(x, 11), ror32(x, 25)); }
+__device__ __forceinline__ uint32_t smallS0(uint32_t x){ return xor3(ror32(x, 7), ror32(x, 18), (x >> 3)); }
+__device__ __forceinline__ uint32_t smallS1(uint32_t x){ return xor3(ror32(x,17), ror32(x, 19), (x >>10)); }
 
-__device__ __constant__ uint32_t K[64] = {
+// Ch = (x&y)^(~x&z) -> LOP3 0xCA;  Maj = (x&y)|(x&z)|(y&z) -> 0xE8. Plain C: ptxas folds
+// each to one LOP3 and may fuse across boundaries (see xor3 note / RIPEMD f-function audit).
+__device__ __forceinline__ uint32_t Ch (uint32_t x,uint32_t y,uint32_t z){
+    return (x & y) ^ (~x & z);
+}
+__device__ __forceinline__ uint32_t Maj(uint32_t x,uint32_t y,uint32_t z){
+    return (x & y) | (x & z) | (y & z);
+}
+
+// SHA-256 round constants. `static constexpr` makes every K[t] (all indices are
+// literal in the fully-unrolled rounds) a compile-time constant EXPRESSION, so each
+// is materialized as an immediate operand with NO memory access — no LDC (constant
+// bank) and no LDG (global load). It also makes K a *front-end* constant, so the
+// IV-seed round-0 fold can absorb K[0] into the constant chain.
+// NOTE: Phase-0 SASS already showed the ORIGINAL `__device__ __constant__` form folds
+// K to immediates too (hash fn LDC=3, NOT ~64 per-round loads), so this is mainly a
+// belt-and-suspenders guarantee + the front-end-constant benefit. Values UNCHANGED
+// => bit-exact. VERIFY on the 5090 with `make sass` (SHA rounds must carry zero K
+// loads). If `static constexpr` ever fails to compile on the toolchain, fall back to
+// `__device__ __constant__` (Phase-0-proven to fold) — NOT `__device__ static const`,
+// a global that can emit an LDG if not folded.
+static constexpr uint32_t K[64] = {
     0x428A2F98,0x71374491,0xB5C0FBCF,0xE9B5DBA5,0x3956C25B,0x59F111F1,0x923F82A4,0xAB1C5ED5,
     0xD807AA98,0x12835B01,0x243185BE,0x550C7DC3,0x72BE5D74,0x80DEB1FE,0x9BDC06A7,0xC19BF174,
     0xE49B69C1,0xEFBE4786,0x0FC19DC6,0x240CA1CC,0x2DE92C6F,0x4A7484AA,0x5CB0A9DC,0x76F988DA,
@@ -34,59 +59,171 @@ __device__ __constant__ uint32_t K[64] = {
     0x748F82EE,0x78A5636F,0x84C87814,0x8CC70208,0x90BEFFFA,0xA4506CEB,0xBEF9A3F7,0xC67178F2
 };
 
-__device__ __constant__ uint32_t IV[8] = {
-    0x6a09e667ul,0xbb67ae85ul,0x3c6ef372ul,0xa54ff53aul,
-    0x510e527ful,0x9b05688cul,0x1f83d9ab ,0x5be0cd19ul
-};
-__device__ __forceinline__ void SHA256Initialize(uint32_t s[8])
-{
-#pragma unroll
-    for (int i = 0; i < 8; i++) s[i] = IV[i];
-}
-__device__ __forceinline__ void SHA256Transform(uint32_t state[8], uint32_t W_in[64])
+// SHA-256 IV is written as literals straight into the state at the single seed
+// site (SHA256_33_from_limbs) so ptxas sees compile-time inputs to round 0 and can
+// constant-fold it, instead of reloading the IV from __constant__ memory (LDC).
+// The former __constant__ IV[8] + SHA256Initialize() are gone; values are unchanged.
+// --- Fully hand-unrolled SHA-256 (branch-free) -------------------------------------
+// Replaces the `#pragma unroll 64` loop + `if (t >= 16)` with 64 straight-line rounds.
+// Uses name-rotated working registers (the caller shifts a..h by one slot each round,
+// so there are no `h=g; g=f; ...` value moves) over an in-place 16-word rolling
+// schedule. Each round mutates only its `d` (d += T1) and `h` (h = T1 + T2) arguments.
+// The round lines + schedule updates were machine-generated and verified bit-exact vs
+// the prior loop and vs hashlib over 40000 random single-block messages.
+#define SHA_RND(a,b,c,d,e,f,g,h, kt, wt) do { \
+    uint32_t T1 = (h) + bigS1(e) + Ch(e,f,g) + (kt) + (wt); \
+    uint32_t T2 = bigS0(a) + Maj(a,b,c); \
+    (d) += T1; \
+    (h) = T1 + T2; \
+} while (0)
+
+// Specialized for the fixed 33-byte compressed-pubkey message: only the 9 data words
+// M[0..8] vary per key; the padding tail is compile-time constant (w[9..14]=0) and the
+// length field is fixed (w[15] = 33*8 = 264). The caller no longer materializes those
+// 7 words, and the schedule words w[16..63] are computed in-place below (never passed in).
+__device__ __forceinline__ void SHA256Transform(uint32_t state[8], const uint32_t M[9])
 {
     uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
     uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
 
     uint32_t w[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) w[i] = W_in[i];
+    w[ 0] = M[ 0];
+    w[ 1] = M[ 1];
+    w[ 2] = M[ 2];
+    w[ 3] = M[ 3];
+    w[ 4] = M[ 4];
+    w[ 5] = M[ 5];
+    w[ 6] = M[ 6];
+    w[ 7] = M[ 7];
+    w[ 8] = M[ 8];
+    w[ 9] = 0u;
+    w[10] = 0u;
+    w[11] = 0u;
+    w[12] = 0u;
+    w[13] = 0u;
+    w[14] = 0u;
+    w[15] = 33u * 8u;   // 264: message-length field for the fixed 33-byte input
 
-#pragma unroll 64
-    for (int t = 0; t < 64; ++t) {
-        if (t >= 16) {
-            uint32_t s0 = smallS0(w[(t + 1)  & 15]);
-            uint32_t s1 = smallS1(w[(t + 14) & 15]);
-            uint32_t newW = w[t & 15] + s1 + w[(t + 9) & 15] + s0;
-            w[t & 15] = newW;
-        }
-        uint32_t Wt = w[t & 15];
-        uint32_t T1 = h + bigS1(e) + Ch(e, f, g) + K[t] + Wt;
-        uint32_t T2 = bigS0(a) + Maj(a, b, c);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d + T1;
-        d = c;
-        c = b;
-        b = a;
-        a = T1 + T2;
-    }
+    SHA_RND(a,b,c,d,e,f,g,h, K[ 0], w[ 0]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[ 1], w[ 1]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[ 2], w[ 2]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[ 3], w[ 3]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[ 4], w[ 4]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[ 5], w[ 5]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[ 6], w[ 6]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[ 7], w[ 7]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[ 8], w[ 8]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[ 9], w[ 9]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[10], w[10]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[11], w[11]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[12], w[12]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[13], w[13]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[14], w[14]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[15], w[15]);
+    w[ 0] += smallS1(w[14]) + w[ 9] + smallS0(w[ 1]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[16], w[ 0]);
+    w[ 1] += smallS1(w[15]) + w[10] + smallS0(w[ 2]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[17], w[ 1]);
+    w[ 2] += smallS1(w[ 0]) + w[11] + smallS0(w[ 3]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[18], w[ 2]);
+    w[ 3] += smallS1(w[ 1]) + w[12] + smallS0(w[ 4]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[19], w[ 3]);
+    w[ 4] += smallS1(w[ 2]) + w[13] + smallS0(w[ 5]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[20], w[ 4]);
+    w[ 5] += smallS1(w[ 3]) + w[14] + smallS0(w[ 6]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[21], w[ 5]);
+    w[ 6] += smallS1(w[ 4]) + w[15] + smallS0(w[ 7]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[22], w[ 6]);
+    w[ 7] += smallS1(w[ 5]) + w[ 0] + smallS0(w[ 8]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[23], w[ 7]);
+    w[ 8] += smallS1(w[ 6]) + w[ 1] + smallS0(w[ 9]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[24], w[ 8]);
+    w[ 9] += smallS1(w[ 7]) + w[ 2] + smallS0(w[10]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[25], w[ 9]);
+    w[10] += smallS1(w[ 8]) + w[ 3] + smallS0(w[11]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[26], w[10]);
+    w[11] += smallS1(w[ 9]) + w[ 4] + smallS0(w[12]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[27], w[11]);
+    w[12] += smallS1(w[10]) + w[ 5] + smallS0(w[13]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[28], w[12]);
+    w[13] += smallS1(w[11]) + w[ 6] + smallS0(w[14]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[29], w[13]);
+    w[14] += smallS1(w[12]) + w[ 7] + smallS0(w[15]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[30], w[14]);
+    w[15] += smallS1(w[13]) + w[ 8] + smallS0(w[ 0]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[31], w[15]);
+    w[ 0] += smallS1(w[14]) + w[ 9] + smallS0(w[ 1]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[32], w[ 0]);
+    w[ 1] += smallS1(w[15]) + w[10] + smallS0(w[ 2]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[33], w[ 1]);
+    w[ 2] += smallS1(w[ 0]) + w[11] + smallS0(w[ 3]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[34], w[ 2]);
+    w[ 3] += smallS1(w[ 1]) + w[12] + smallS0(w[ 4]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[35], w[ 3]);
+    w[ 4] += smallS1(w[ 2]) + w[13] + smallS0(w[ 5]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[36], w[ 4]);
+    w[ 5] += smallS1(w[ 3]) + w[14] + smallS0(w[ 6]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[37], w[ 5]);
+    w[ 6] += smallS1(w[ 4]) + w[15] + smallS0(w[ 7]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[38], w[ 6]);
+    w[ 7] += smallS1(w[ 5]) + w[ 0] + smallS0(w[ 8]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[39], w[ 7]);
+    w[ 8] += smallS1(w[ 6]) + w[ 1] + smallS0(w[ 9]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[40], w[ 8]);
+    w[ 9] += smallS1(w[ 7]) + w[ 2] + smallS0(w[10]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[41], w[ 9]);
+    w[10] += smallS1(w[ 8]) + w[ 3] + smallS0(w[11]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[42], w[10]);
+    w[11] += smallS1(w[ 9]) + w[ 4] + smallS0(w[12]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[43], w[11]);
+    w[12] += smallS1(w[10]) + w[ 5] + smallS0(w[13]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[44], w[12]);
+    w[13] += smallS1(w[11]) + w[ 6] + smallS0(w[14]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[45], w[13]);
+    w[14] += smallS1(w[12]) + w[ 7] + smallS0(w[15]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[46], w[14]);
+    w[15] += smallS1(w[13]) + w[ 8] + smallS0(w[ 0]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[47], w[15]);
+    w[ 0] += smallS1(w[14]) + w[ 9] + smallS0(w[ 1]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[48], w[ 0]);
+    w[ 1] += smallS1(w[15]) + w[10] + smallS0(w[ 2]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[49], w[ 1]);
+    w[ 2] += smallS1(w[ 0]) + w[11] + smallS0(w[ 3]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[50], w[ 2]);
+    w[ 3] += smallS1(w[ 1]) + w[12] + smallS0(w[ 4]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[51], w[ 3]);
+    w[ 4] += smallS1(w[ 2]) + w[13] + smallS0(w[ 5]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[52], w[ 4]);
+    w[ 5] += smallS1(w[ 3]) + w[14] + smallS0(w[ 6]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[53], w[ 5]);
+    w[ 6] += smallS1(w[ 4]) + w[15] + smallS0(w[ 7]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[54], w[ 6]);
+    w[ 7] += smallS1(w[ 5]) + w[ 0] + smallS0(w[ 8]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[55], w[ 7]);
+    w[ 8] += smallS1(w[ 6]) + w[ 1] + smallS0(w[ 9]);
+    SHA_RND(a,b,c,d,e,f,g,h, K[56], w[ 8]);
+    w[ 9] += smallS1(w[ 7]) + w[ 2] + smallS0(w[10]);
+    SHA_RND(h,a,b,c,d,e,f,g, K[57], w[ 9]);
+    w[10] += smallS1(w[ 8]) + w[ 3] + smallS0(w[11]);
+    SHA_RND(g,h,a,b,c,d,e,f, K[58], w[10]);
+    w[11] += smallS1(w[ 9]) + w[ 4] + smallS0(w[12]);
+    SHA_RND(f,g,h,a,b,c,d,e, K[59], w[11]);
+    w[12] += smallS1(w[10]) + w[ 5] + smallS0(w[13]);
+    SHA_RND(e,f,g,h,a,b,c,d, K[60], w[12]);
+    w[13] += smallS1(w[11]) + w[ 6] + smallS0(w[14]);
+    SHA_RND(d,e,f,g,h,a,b,c, K[61], w[13]);
+    w[14] += smallS1(w[12]) + w[ 7] + smallS0(w[15]);
+    SHA_RND(c,d,e,f,g,h,a,b, K[62], w[14]);
+    w[15] += smallS1(w[13]) + w[ 8] + smallS0(w[ 0]);
+    SHA_RND(b,c,d,e,f,g,h,a, K[63], w[15]);
 
     state[0] += a; state[1] += b; state[2] += c; state[3] += d;
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
-__device__ __forceinline__ void RIPEMD160Initialize(uint32_t s[5])
-{
-
-	s[0] = 0x67452301ul;
-	s[1] = 0xEFCDAB89ul;
-	s[2] = 0x98BADCFEul;
-	s[3] = 0x10325476ul;
-	s[4] = 0xC3D2E1F0ul;
-
-}
+#undef SHA_RND
+// RIPEMD-160 IV is written as literals at its single seed site
+// (RIPEMD160_from_SHA256_state). These values were already literals, so this is a
+// pure code-tidy — no codegen change — kept for symmetry with the SHA-256 seed.
 
 #define ROL(x,n) ((x>>(32-n))|(x<<n))
 #define f1(x, y, z) (x ^ y ^ z)
@@ -290,211 +427,124 @@ __device__ __forceinline__ void RIPEMD160Transform(uint32_t s[5], uint32_t* w)
     s[4] = t + b1 + c2;
 }
 
-__device__ void getSHA256_33bytes(const uint8_t* pubkey33, uint8_t sha[32]);
-__device__ void getRIPEMD160_32bytes(const uint8_t* sha, uint8_t ripemd[20]);
-
-__device__ __forceinline__ void getSHA256_33bytes(const uint8_t* pubkey33, uint8_t sha[32]) {
-    uint32_t M[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) M[i] = 0;
-
-#pragma unroll
-    for (int i = 0; i < 33; ++i) {
-        M[i >> 2] |= (uint32_t)pubkey33[i] << (24 - ((i & 3) << 3));
-    }
-    M[8] |= (uint32_t)0x80 << (24 - ((33 & 3) << 3));
-    M[14] = 0;
-    M[15] = 33u * 8u;
-
-    uint32_t state[8];
-    SHA256Initialize(state);
-    SHA256Transform(state, M);
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        sha[4 * i + 0] = (uint8_t)(state[i] >> 24);
-        sha[4 * i + 1] = (uint8_t)(state[i] >> 16);
-        sha[4 * i + 2] = (uint8_t)(state[i] >> 8);
-        sha[4 * i + 3] = (uint8_t)(state[i] >> 0);
-    }
-}
-__device__ __forceinline__ void getRIPEMD160_32bytes(const uint8_t* sha, uint8_t ripemd[20])
-{
-    uint8_t block[64] = {0};
-    
-    for (int i = 0; i < 32; i++) {
-    block[i] = sha[i];
-    }  
-    block[32] = 0x80;
-    const uint32_t bitLen = 256;  
-
-    block[56] = bitLen & 0xFF;
-    block[57] = (bitLen >> 8) & 0xFF;
-    block[58] = (bitLen >> 16) & 0xFF;
-    block[59] = (bitLen >> 24) & 0xFF;
-
-    uint32_t W[16];
-    
-    for (int i = 0; i < 16; i++) {
-        W[i] = ((uint32_t)block[4*i+3] << 24) |
-               ((uint32_t)block[4*i+2] << 16) |
-               ((uint32_t)block[4*i+1] << 8) |
-               ((uint32_t)block[4*i]);
-    }
-
-    uint32_t state[5];
-    RIPEMD160Initialize(state);
-    RIPEMD160Transform(state, W);
-   
-    for (int i = 0; i < 5; i++) {
-        ripemd[4*i]   = (state[i] >> 0) & 0xFF;
-        ripemd[4*i+1] = (state[i] >> 8) & 0xFF;
-        ripemd[4*i+2] = (state[i] >> 16) & 0xFF;
-        ripemd[4*i+3] = (state[i] >> 24) & 0xFF;
-    }
-}
-
-__device__ void getHash160_33bytes(const uint8_t* pubkey33, uint8_t* hash20);
-
-__device__  void getHash160_33bytes(const uint8_t* pubkey33, uint8_t* hash20)
-{
-    uint8_t sha256[32];
-    getSHA256_33bytes(pubkey33, sha256);
-    getRIPEMD160_32bytes(sha256, hash20);
-}
-
-__device__ __forceinline__ uint64_t loadU64BE(const uint8_t* p) {
-    return ((uint64_t)p[0] << 56) |
-           ((uint64_t)p[1] << 48) |
-           ((uint64_t)p[2] << 40) |
-           ((uint64_t)p[3] << 32) |
-           ((uint64_t)p[4] << 24) |
-           ((uint64_t)p[5] << 16) |
-           ((uint64_t)p[6] <<  8) |
-           ((uint64_t)p[7] <<  0);
-}
-
-__device__ __forceinline__ void storeU64BE(uint8_t* p, uint64_t x) {
-    p[0] = (uint8_t)(x >> 56);
-    p[1] = (uint8_t)(x >> 48);
-    p[2] = (uint8_t)(x >> 40);
-    p[3] = (uint8_t)(x >> 32);
-    p[4] = (uint8_t)(x >> 24);
-    p[5] = (uint8_t)(x >> 16);
-    p[6] = (uint8_t)(x >>  8);
-    p[7] = (uint8_t)(x >>  0);
-}
-
-__device__ __forceinline__ void addBigEndian256(uint8_t* key33, uint64_t offset)
-{
-    uint8_t* coord = key33 + 1;
-    uint64_t x0 = loadU64BE(coord);        
-    uint64_t x1 = loadU64BE(coord + 8);
-    uint64_t x2 = loadU64BE(coord + 16);
-    uint64_t x3 = loadU64BE(coord + 24);     
-
-    uint64_t new_x3 = x3 + offset;
-
-    if (new_x3 >= x3) {
-        x3 = new_x3;
-    }
-    else {
-        x3 = new_x3;
-        uint64_t new_x2 = x2 + 1;
-        if (new_x2 >= x2) {
-            x2 = new_x2;
-        }
-        else {
-            x2 = new_x2;
-            uint64_t new_x1 = x1 + 1;
-            if (new_x1 >= x1) {
-                x1 = new_x1;
-            }
-            else {
-                x1 = new_x1;
-                x0 = x0 + 1;
-            }
-        }
-    }
-
-    storeU64BE(coord,     x0);
-    storeU64BE(coord + 8, x1);
-    storeU64BE(coord + 16, x2);
-    storeU64BE(coord + 24, x3);
-}
-
-__device__ __forceinline__ bool compare20(const uint8_t* h, const uint8_t* ref) {
-    ulonglong2 a, b;
-    uint32_t c, d;
-    
-    memcpy(&a, h, sizeof(ulonglong2));
-    memcpy(&b, ref, sizeof(ulonglong2));
-    
-    memcpy(&c, h + 16, sizeof(uint32_t));
-    memcpy(&d, ref + 16, sizeof(uint32_t));
-    
-    return (a.x == b.x) && (a.y == b.y) && (c == d);
-}
 
 __device__ __forceinline__ uint32_t bswap32(uint32_t x){
-    return ((x & 0x000000FFu) << 24) | ((x & 0x0000FF00u) << 8) | ((x & 0x00FF0000u) >> 8) | ((x & 0xFF000000u) >> 24);
+    return __byte_perm(x, 0, 0x0123);   // reverse the 4 bytes in one PRMT
 }
-__device__ __forceinline__ uint32_t pack_be4(uint8_t a,uint8_t b,uint8_t c,uint8_t d){
-    return ((uint32_t)a<<24)|((uint32_t)b<<16)|((uint32_t)c<<8)|((uint32_t)d);
-}
+// SHA-256 message build for the fixed 33-byte compressed pubkey. The high/low 32-bit
+// halves of each little-endian X limb are ALREADY big-endian-ordered when read as u32
+// (v>>32 puts X's most-significant byte in the u32 MSB), so e0..e7 need no per-byte bswap.
+// e0 = top 32 bits of X ... e7 = low 32 bits. The 33-byte message is [prefix] ++ BE(X),
+// so each SHA word is a 1-byte-shifted window across e0..e7 -- one PRMT (__byte_perm) each:
+//   M[j] = (e[j-1] << 24) | (e[j] >> 8)  ==  __byte_perm(e[j], e[j-1], 0x4321)
+// Replaces the per-byte pack_be4 shift/mask chains; verified bit-exact vs the old build
+// over 2e6 random + edge inputs (host emulation of __byte_perm).
 __device__ __forceinline__ void SHA256_33_from_limbs(uint8_t prefix02_03, const uint64_t x_be_limbs[4], uint32_t out_state[16]){
-    const uint64_t v3 = x_be_limbs[3];
-    const uint64_t v2 = x_be_limbs[2];
-    const uint64_t v1 = x_be_limbs[1];
-    const uint64_t v0 = x_be_limbs[0];
-    uint32_t M[16];
-    M[0] = pack_be4(prefix02_03, (uint8_t)(v3>>56), (uint8_t)(v3>>48), (uint8_t)(v3>>40));
-    M[1] = pack_be4((uint8_t)(v3>>32), (uint8_t)(v3>>24), (uint8_t)(v3>>16), (uint8_t)(v3>>8));
-    M[2] = pack_be4((uint8_t)(v3>>0), (uint8_t)(v2>>56), (uint8_t)(v2>>48), (uint8_t)(v2>>40));
-    M[3] = pack_be4((uint8_t)(v2>>32), (uint8_t)(v2>>24), (uint8_t)(v2>>16), (uint8_t)(v2>>8));
-    M[4] = pack_be4((uint8_t)(v2>>0), (uint8_t)(v1>>56), (uint8_t)(v1>>48), (uint8_t)(v1>>40));
-    M[5] = pack_be4((uint8_t)(v1>>32), (uint8_t)(v1>>24), (uint8_t)(v1>>16), (uint8_t)(v1>>8));
-    M[6] = pack_be4((uint8_t)(v1>>0), (uint8_t)(v0>>56), (uint8_t)(v0>>48), (uint8_t)(v0>>40));
-    M[7] = pack_be4((uint8_t)(v0>>32), (uint8_t)(v0>>24), (uint8_t)(v0>>16), (uint8_t)(v0>>8));
-    M[8] = pack_be4((uint8_t)(v0>>0), 0x80u, 0x00u, 0x00u);
-#pragma unroll
-    for(int i=9;i<16;++i) M[i]=0;
-    M[15] = 33u*8u;
+    const uint32_t e0 = (uint32_t)(x_be_limbs[3] >> 32), e1 = (uint32_t)x_be_limbs[3];
+    const uint32_t e2 = (uint32_t)(x_be_limbs[2] >> 32), e3 = (uint32_t)x_be_limbs[2];
+    const uint32_t e4 = (uint32_t)(x_be_limbs[1] >> 32), e5 = (uint32_t)x_be_limbs[1];
+    const uint32_t e6 = (uint32_t)(x_be_limbs[0] >> 32), e7 = (uint32_t)x_be_limbs[0];
+    // Only the 9 data words are built here; SHA256Transform bakes in the constant
+    // padding tail (w[9..14]=0) and length word (w[15]=264) itself.
+    uint32_t M[9];
+    M[0] = __byte_perm(e0, (uint32_t)prefix02_03, 0x4321);   // [prefix, X.b0, X.b1, X.b2]
+    M[1] = __byte_perm(e1, e0, 0x4321);
+    M[2] = __byte_perm(e2, e1, 0x4321);
+    M[3] = __byte_perm(e3, e2, 0x4321);
+    M[4] = __byte_perm(e4, e3, 0x4321);
+    M[5] = __byte_perm(e5, e4, 0x4321);
+    M[6] = __byte_perm(e6, e5, 0x4321);
+    M[7] = __byte_perm(e7, e6, 0x4321);
+    M[8] = __byte_perm(e7, 0x00000080u, 0x0455);             // [X.b31, 0x80, 0x00, 0x00]
     uint32_t st[8];
-    SHA256Initialize(st);
+    // SHA-256 IV as literals (was SHA256Initialize copying from __constant__ IV[8]).
+    // Seeding st[] with immediates lets ptxas constant-fold round 0; SHA256Transform
+    // and its final `state[i] += var` are untouched, so st[i] is bit-identical.
+    st[0] = 0x6a09e667u;
+    st[1] = 0xbb67ae85u;
+    st[2] = 0x3c6ef372u;
+    st[3] = 0xa54ff53au;
+    st[4] = 0x510e527fu;
+    st[5] = 0x9b05688cu;
+    st[6] = 0x1f83d9abu;
+    st[7] = 0x5be0cd19u;
     SHA256Transform(st, M);
-#pragma unroll
-    for(int i=0;i<8;++i) out_state[i]= bswap32(st[i]);
+    out_state[0]=bswap32(st[0]); out_state[1]=bswap32(st[1]); out_state[2]=bswap32(st[2]); out_state[3]=bswap32(st[3]);
+    out_state[4]=bswap32(st[4]); out_state[5]=bswap32(st[5]); out_state[6]=bswap32(st[6]); out_state[7]=bswap32(st[7]);
 }
 
 __device__ __forceinline__ void RIPEMD160_from_SHA256_state(uint32_t sha_state_le[16],
-                                                            uint8_t ripemd20[20])
+                                                            uint32_t out5[5])
 {
     sha_state_le[8]  = 0x00000080u;
-#pragma unroll
-    for(int i=9;i<14;++i) sha_state_le[i]=0;
+    sha_state_le[9]=0u; sha_state_le[10]=0u; sha_state_le[11]=0u; sha_state_le[12]=0u; sha_state_le[13]=0u;
     sha_state_le[14] = 256u;
     sha_state_le[15] = 0u;
 
-    uint32_t s[5];
-    RIPEMD160Initialize(s);
-    RIPEMD160Transform(s, sha_state_le);
-#pragma unroll
-    for (int i = 0; i < 5; ++i) {
-        ripemd20[4*i+0] = (uint8_t)(s[i] >> 0);
-        ripemd20[4*i+1] = (uint8_t)(s[i] >> 8);
-        ripemd20[4*i+2] = (uint8_t)(s[i] >>16);
-        ripemd20[4*i+3] = (uint8_t)(s[i] >>24);
-    }
+    // RIPEMD-160 IV as literals, written straight into out5 — which doubles as the
+    // RIPEMD state. RIPEMD160Transform reads these at entry, leaves them untouched
+    // through the 80 rounds, then overwrites them with the final digest, so the old
+    // s[5] scratch + 5-word copy-back were redundant. (out5 and sha_state_le are
+    // distinct buffers, so no aliasing.) out5[i] is hash160 word i, little-endian.
+    out5[0] = 0x67452301u;
+    out5[1] = 0xEFCDAB89u;
+    out5[2] = 0x98BADCFEu;
+    out5[3] = 0x10325476u;
+    out5[4] = 0xC3D2E1F0u;
+    RIPEMD160Transform(out5, sha_state_le);
 }
 
-__device__ __noinline__ void getHash160_33_from_limbs(uint8_t prefix02_03,
-                                                      const uint64_t x_be_limbs[4],
-                                                      uint8_t out20[20])
+// BY-VALUE ABI (x in by value, hash160 out by value) -- see CUDAHash.cuh for the measured effect
+// and why this must not be reverted to pointers. __noinline__ is deliberate: the CALL is kept,
+// only its ABI changed. The body is unchanged from the pointer version, so the hash is bit-exact.
+__device__ __noinline__ H160 getHash160_33_from_limbs(uint8_t prefix02_03, U256 x)
 {
     uint32_t sha_state[16];
-    SHA256_33_from_limbs(prefix02_03, x_be_limbs, sha_state);
-    RIPEMD160_from_SHA256_state(sha_state, out20);
+    SHA256_33_from_limbs(prefix02_03, x.v, sha_state);   // x arrives in regs; callee is forceinline
+    H160 h;
+    RIPEMD160_from_SHA256_state(sha_state, h.w);         // forceinline -> SROA keeps h.w in regs
+    return h;
+}
+
+// ============================================================================
+// Uncompressed (65-byte) path: hash160 of 0x04 || X(32 BE) || Y(32 BE).
+// The compressed path above uses SHA256Transform hardwired to the 33-byte message
+// (padding + length baked in), so it cannot hash the 65-byte input, which spans two
+// SHA-256 blocks. Below is a generic 16-word-block transform + the 2-block message
+// build, ported from the pointer-API version and verified bit-exact vs a Python
+// reference; only the ABI (by-value U256 in, H160 out) changed.
+// ============================================================================
+
+__device__ __forceinline__ uint32_t pack_be4(uint8_t a,uint8_t b,uint8_t c,uint8_t d){
+    return ((uint32_t)a<<24)|((uint32_t)b<<16)|((uint32_t)c<<8)|((uint32_t)d);
+}
+
+// Generic SHA-256 block compression (full 16-word message, in-place schedule). Same K and
+// round functions as SHA256Transform -> bit-exact SHA-256; only used by the cold 65-byte path.
+__device__ __forceinline__ void SHA256Transform_generic(uint32_t state[8], const uint32_t M[16])
+{
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+    uint32_t w[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) w[i] = M[i];
+
+#pragma unroll 64
+    for (int t = 0; t < 64; ++t) {
+        if (t >= 16) {
+            uint32_t s0 = smallS0(w[(t + 1)  & 15]);
+            uint32_t s1 = smallS1(w[(t + 14) & 15]);
+            w[t & 15] = w[t & 15] + s1 + w[(t + 9) & 15] + s0;
+        }
+        uint32_t Wt = w[t & 15];
+        uint32_t T1 = h + bigS1(e) + Ch(e, f, g) + K[t] + Wt;
+        uint32_t T2 = bigS0(a) + Maj(a, b, c);
+        h = g; g = f; f = e; e = d + T1; d = c; c = b; b = a; a = T1 + T2;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
 
 // SHA-256 of the 65-byte uncompressed pubkey (0x04 || X(32 BE) || Y(32 BE)).
@@ -506,8 +556,11 @@ __device__ __forceinline__ void SHA256_65_from_limbs(const uint64_t x_be_limbs[4
     const uint64_t x3=x_be_limbs[3], x2=x_be_limbs[2], x1=x_be_limbs[1], x0=x_be_limbs[0];
     const uint64_t y3=y_be_limbs[3], y2=y_be_limbs[2], y1=y_be_limbs[1], y0=y_be_limbs[0];
 
-    uint32_t st[8];
-    SHA256Initialize(st);
+    // SHA-256 IV as literals (matches the seed style of the 33-byte path).
+    uint32_t st[8] = {
+        0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+        0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u
+    };
 
     uint32_t M[16];
     // Block 0: 0x04 || X(32) || Y[0..30]  (the last Y byte spills into block 1)
@@ -527,24 +580,25 @@ __device__ __forceinline__ void SHA256_65_from_limbs(const uint64_t x_be_limbs[4
     M[13] = pack_be4((uint8_t)(y1>>32),(uint8_t)(y1>>24),(uint8_t)(y1>>16),(uint8_t)(y1>>8));
     M[14] = pack_be4((uint8_t)(y1>>0),(uint8_t)(y0>>56),(uint8_t)(y0>>48),(uint8_t)(y0>>40));
     M[15] = pack_be4((uint8_t)(y0>>32),(uint8_t)(y0>>24),(uint8_t)(y0>>16),(uint8_t)(y0>>8));
-    SHA256Transform(st, M);
+    SHA256Transform_generic(st, M);
 
     // Block 1: last Y byte, 0x80 pad, zeros, then the 64-bit bit length (520).
     M[0] = pack_be4((uint8_t)(y0>>0), 0x80u, 0x00u, 0x00u);
 #pragma unroll
     for (int i=1;i<15;++i) M[i]=0u;
     M[15] = 65u*8u;
-    SHA256Transform(st, M);
+    SHA256Transform_generic(st, M);
 
 #pragma unroll
     for(int i=0;i<8;++i) out_state[i]= bswap32(st[i]);
 }
 
-__device__ __noinline__ void getHash160_65_from_limbs(const uint64_t x_be_limbs[4],
-                                                      const uint64_t y_be_limbs[4],
-                                                      uint8_t out20[20])
+// BY-VALUE ABI, same rationale as getHash160_33_from_limbs (see CUDAHash.cuh). Uncompressed key.
+__device__ __noinline__ H160 getHash160_65_from_limbs(U256 x, U256 y)
 {
     uint32_t sha_state[16];
-    SHA256_65_from_limbs(x_be_limbs, y_be_limbs, sha_state);
-    RIPEMD160_from_SHA256_state(sha_state, out20);
+    SHA256_65_from_limbs(x.v, y.v, sha_state);
+    H160 h;
+    RIPEMD160_from_SHA256_state(sha_state, h.w);
+    return h;
 }
