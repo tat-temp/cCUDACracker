@@ -4,10 +4,26 @@ OBJ         := $(SRC:.cu=.o)
 CC          := nvcc
 
 GPU_ARCH ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')
-SM_ARCHS   := 75 86 89 $(GPU_ARCH)
-GENCODE    := $(foreach arch,$(SM_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
+SM_ARCHS   := 75 86 89
 
-NVCC_FLAGS := -O3 -rdc=true -use_fast_math --ptxas-options=-O3 $(GENCODE)
+# Hopper (compute_90) needs CUDA >= 12. Add it automatically on a capable toolkit,
+# or force it on/off with: make SM90=1  /  make SM90=0
+CUDA_MAJOR ?= $(shell nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\).*/\1/p' | head -n1)
+ifeq ($(SM90),1)
+SM_ARCHS += 90
+else ifeq ($(SM90),0)
+# explicitly disabled
+else ifeq ($(shell [ -n "$(CUDA_MAJOR)" ] && [ "$(CUDA_MAJOR)" -ge 12 ] 2>/dev/null && echo yes),yes)
+SM_ARCHS += 90
+endif
+
+SM_ARCHS += $(GPU_ARCH)
+GENCODE    := $(foreach arch,$(sort $(SM_ARCHS)),-gencode arch=compute_$(arch),code=sm_$(arch))
+
+# --maxrregcount=128 matches the kernel's __launch_bounds__(256,2) ceiling so that
+# separately-compiled device functions (e.g. getHash160_65_from_limbs) stay within
+# the caller's register budget; without it nvlink rejects the call on sm_90.
+NVCC_FLAGS := -O3 -rdc=true -use_fast_math --maxrregcount=128 --ptxas-options=-O3 $(GENCODE)
 CXXFLAGS   := -std=c++17
 
 LDFLAGS    := -lcudadevrt -cudart=static
